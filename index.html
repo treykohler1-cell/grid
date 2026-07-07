@@ -149,9 +149,27 @@
   let baseName = 'image';
   let hasImage = false;
   let currentZipEntries = null;
+  let currentQuadStems = null;
+  let currentNumbered = false;
 
   function sanitize(name){
     return name.replace(/\.[^/.]+$/, '').replace(/[^a-z0-9_\-]+/gi, '_').replace(/^_+|_+$/g,'') || 'image';
+  }
+
+  // Recognizes filenames like "5-8" (start-end, exactly a 4-number span) so
+  // quadrants can be exported as the individual frame numbers instead.
+  function parseNumberRange(filename){
+    const base = (filename || '').replace(/\.[^/.]+$/, '').trim();
+    const m = base.match(/^(\d+)\s*-\s*(\d+)$/);
+    if (!m) return null;
+    const start = parseInt(m[1], 10);
+    const end = parseInt(m[2], 10);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end - start !== 3) return null;
+    return { start, end };
+  }
+
+  function pad(n, width){
+    return String(n).padStart(width, '0');
   }
 
   function handleFiles(fileList){
@@ -179,10 +197,38 @@
     hint.textContent = 'Batch mode — processing each grid below.';
   }
 
+  function quadStemsFor(fileName, sanitizedBase){
+    const range = parseNumberRange(fileName);
+    if (range){
+      const width = String(range.end).length;
+      return {
+        stems: {
+          tl: pad(range.start, width),
+          tr: pad(range.start + 1, width),
+          bl: pad(range.start + 2, width),
+          br: pad(range.start + 3, width),
+        },
+        numbered: true,
+      };
+    }
+    return {
+      stems: {
+        tl: `${quadNames.tl}_${sanitizedBase}`,
+        tr: `${quadNames.tr}_${sanitizedBase}`,
+        bl: `${quadNames.bl}_${sanitizedBase}`,
+        br: `${quadNames.br}_${sanitizedBase}`,
+      },
+      numbered: false,
+    };
+  }
+
   function loadFile(file){
     if (!file || !file.type || !file.type.startsWith('image/')) return;
     showSingleMode();
     baseName = sanitize(file.name || 'image');
+    const { stems, numbered } = quadStemsFor(file.name || 'image', baseName);
+    currentQuadStems = stems;
+    currentNumbered = numbered;
     const url = URL.createObjectURL(file);
     const img = new Image();
     img.onload = () => {
@@ -300,7 +346,8 @@
     const trimmed = borderIsTrimmed(borders);
     quadsEl.style.display = 'grid';
     downloadAllBtn.disabled = false;
-    hint.textContent = `Loaded ${w}×${h}px.${trimmed ? ' White borders trimmed —' : ''} Each quadrant exports stretched to ${OUT_W}×${OUT_H} (16:9).`;
+    const numberedNote = currentNumbered ? ` Detected sequential numbering — exporting as ${currentQuadStems.tl}.png…${currentQuadStems.br}.png.` : '';
+    hint.textContent = `Loaded ${w}×${h}px.${trimmed ? ' White borders trimmed —' : ''} Each quadrant exports stretched to ${OUT_W}×${OUT_H} (16:9).${numberedNote}`;
   }
 
   function downloadQuad(key, delayMs){
@@ -311,7 +358,7 @@
           const a = document.createElement('a');
           const url = URL.createObjectURL(blob);
           a.href = url;
-          a.download = `${quadNames[key]}_${baseName}.png`;
+          a.download = `${(currentQuadStems && currentQuadStems[key]) || `${quadNames[key]}_${baseName}`}.png`;
           document.body.appendChild(a);
           a.click();
           a.remove();
@@ -424,13 +471,13 @@
   }
 
   // --- Batch mode ---
-  const usedBaseNames = new Set();
+  const usedOutputNames = new Set();
 
-  function uniqueBaseName(raw){
-    let name = raw, n = 2;
-    while (usedBaseNames.has(name)){ name = `${raw}_${n}`; n++; }
-    usedBaseNames.add(name);
-    return name;
+  function uniqueOutputName(name){
+    let candidate = name, n = 2;
+    while (usedOutputNames.has(candidate)){ candidate = `${name}_${n}`; n++; }
+    usedOutputNames.add(candidate);
+    return candidate;
   }
 
   function createBatchRow(file){
@@ -453,7 +500,7 @@
     };
   }
 
-  function processOneGridFile(file){
+  function processOneGridFile(file, padWidth){
     return new Promise((resolve, reject) => {
       const url = URL.createObjectURL(file);
       const img = new Image();
@@ -469,7 +516,8 @@
 
           const borders = detectBorders(octx.getImageData(0, 0, w, h).data, w, h);
           const rects = rectsFromBorders(borders, w, h);
-          const name = uniqueBaseName(sanitize(file.name || 'image'));
+          const range = parseNumberRange(file.name || '');
+          const sanitizedBase = sanitize(file.name || 'image');
 
           const entries = [];
           for (const key of ['tl', 'tr', 'bl', 'br']){
@@ -481,7 +529,11 @@
             ctx.drawImage(off, sx, sy, sw, sh, 0, 0, OUT_W, OUT_H);
             const blob = await new Promise(res => c.toBlob(res, 'image/png'));
             const data = new Uint8Array(await blob.arrayBuffer());
-            entries.push({ name: `${quadNames[key]}_${name}.png`, data });
+            const idx = ['tl', 'tr', 'bl', 'br'].indexOf(key);
+            const stem = range
+              ? pad(range.start + idx, padWidth)
+              : `${quadNames[key]}_${sanitizedBase}`;
+            entries.push({ name: `${uniqueOutputName(stem)}.png`, data });
           }
           resolve(entries);
         } catch (err){
@@ -496,7 +548,7 @@
   async function startBatch(files){
     showBatchMode();
     batchList.innerHTML = '';
-    usedBaseNames.clear();
+    usedOutputNames.clear();
     downloadZipBtn.disabled = true;
     currentZipEntries = null;
 
@@ -505,14 +557,24 @@
     const skipNote = skipped ? ` Skipped ${skipped} beyond the ${MAX_BATCH}-grid limit.` : '';
     const rows = capped.map(f => createBatchRow(f));
 
-    batchStatus.textContent = `Processing 0 / ${capped.length}...${skipNote}`;
+    // Pre-scan for "N-M" numbered filenames so every numbered export in the
+    // batch shares one zero-pad width (e.g. 280 frames -> 3 digits, "001").
+    let maxNum = 0, numberedCount = 0;
+    capped.forEach(f => {
+      const range = parseNumberRange(f.name || '');
+      if (range){ numberedCount++; maxNum = Math.max(maxNum, range.end); }
+    });
+    const padWidth = maxNum ? String(maxNum).length : 1;
+    const numberedNote = numberedCount ? ` Detected sequential numbering on ${numberedCount} file${numberedCount === 1 ? '' : 's'} — exporting those as numbered frames.` : '';
+
+    batchStatus.textContent = `Processing 0 / ${capped.length}...${skipNote}${numberedNote}`;
 
     const zipEntries = [];
     let done = 0, failed = 0, totalBytes = 0;
     for (let i = 0; i < capped.length; i++){
       rows[i].setStatus('Processing…');
       try {
-        const entries = await processOneGridFile(capped[i]);
+        const entries = await processOneGridFile(capped[i], padWidth);
         entries.forEach(e => { zipEntries.push(e); totalBytes += e.data.length; });
         rows[i].setStatus('Done', 'done');
       } catch (err){
@@ -520,7 +582,7 @@
         rows[i].setStatus('Failed', 'error');
       }
       done++;
-      batchStatus.textContent = `Processed ${done} / ${capped.length}${failed ? ` (${failed} failed)` : ''} — ~${(totalBytes / 1024 / 1024).toFixed(1)} MB so far.${skipNote}`;
+      batchStatus.textContent = `Processed ${done} / ${capped.length}${failed ? ` (${failed} failed)` : ''} — ~${(totalBytes / 1024 / 1024).toFixed(1)} MB so far.${skipNote}${numberedNote}`;
     }
 
     currentZipEntries = zipEntries;
